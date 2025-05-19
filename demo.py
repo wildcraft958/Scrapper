@@ -3,15 +3,14 @@ import json
 import os
 import csv
 import time
-import re
-import hashlib
 from dotenv import load_dotenv
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, TypeAdapter
 from crawl4ai import (
     AsyncWebCrawler, BrowserConfig, CacheMode, CrawlerRunConfig, LLMConfig
 )
 from crawl4ai.extraction_strategy import LLMExtractionStrategy
+from litellm import completion                       
 
 load_dotenv()
 key = os.getenv("OPENROUTER_KEY")
@@ -30,108 +29,133 @@ class Product(BaseModel):
     badge: Optional[str] = None
     reviews: Optional[str] = None
     
-# Revised instruction prompt
-instruction_llm = """Extract product data as JSON array with strict schema:
+instruction_llm = """
+Extract all bread and pav products from the webpage.
+For each product, extract these fields:
+- title: The product name
+- weight: Weight or quantity information
+- price: Price with currency symbol
+- badge: Any promotional badge (if available)
+- reviews: Review information (if available)
+
+Return a JSON array where each item is a product object.
+Example:
 [
   {
-    "title": "Product Name (exact from page)",
-    "weight": "Extracted weight (e.g., '400g')",
-    "price": "₹XX.XX (numeric only)",
-    "badge": "Promotional text/null",
-    "reviews": "Star rating/text/null"
+    "title": "Product Name",
+    "weight": "400g",
+    "price": "Rs.50",
+    "badge": null,
+    "reviews": null
   }
 ]
+"""
 
-Rules:
-1. Convert all prices to ₹ format
-2. Extract weights from titles when separate field missing
-3. Return empty array if no products found
-4. Skip malformed entries
-5. Never add explanatory text"""
+# 1) A little helper to wrap raw strings
+class OpenRouterWrapper:
+    def __init__(self, model, **default_kwargs):
+        self.model = model
+        self.default_kwargs = default_kwargs
 
-# Enhanced product validation
-def validate_products(raw_data: list) -> List[Product]:
-    validated = []
-    error_log = []
-    
-    for idx, item in enumerate(raw_data):
-        try:
-            # Convert all values to strings
-            sanitized = {k: str(v) for k, v in item.items()}
-            
-            # Price normalization
-            if 'price' in sanitized:
-                sanitized['price'] = re.sub(r'[^\d.]', '', sanitized['price'])
-                
-            # Weight extraction fallback
-            if not sanitized.get('weight'):
-                if match := re.search(r'(\d+\s*[gG]|\d+\s*[kK][gG])', sanitized.get('title', '')):
-                    sanitized['weight'] = match.group(1)
-                    
-            product = Product(**sanitized)
-            validated.append(product)
-        except Exception as e:
-            error_log.append({
-                "index": idx,
-                "item": item,
-                "error": str(e)
-            })
-    
-    if error_log:
-        with open("validation_errors.json", "w", encoding="utf-8") as f:
-            json.dump(error_log, f, indent=2)
-    
-    return validated
+    def startswith(self, prefix):
+        return self.model.startswith(prefix)
+
+    def __call__(self, *, messages, transforms=None, route=None, **extra_args):
+        raw_text = completion(
+            model=self.model,
+            messages=messages,
+            transforms=transforms,
+            route=route,
+            **{**self.default_kwargs, **extra_args},
+        )
+        class Choice:
+            def __init__(self, text):
+                self.text = text
+
+        class FakeResp:
+            def __init__(self, text):
+                self.choices = [Choice(text)]
+
+        return FakeResp(raw_text)
 
 async def main():
-    # Enhanced retry logic with exponential backoff
-    max_retries = 7
-    base_delay = 8
+    # Use smaller model to avoid rate limits
+
+    # Configure LLM via Litellm wrapper
+    my_llm_client = OpenRouterWrapper(
+        model="openrouter/deepseek/deepseek-r1:free",
+        temperature=0.0,
+        max_tokens=2000,
+    )
+    llm_cfg = LLMConfig(
+        provider=my_llm_client,                           
+        api_token=os.getenv("OPENROUTER_KEY"),
+    )
+    
+    # combined with tool/function calling
+    strategy = LLMExtractionStrategy(
+        llm_config=llm_cfg,
+        extraction_type="block",  # Use block instead of schema
+        instruction=instruction_llm,
+        chunk_token_threshold=1200,
+        overlap_rate=0.1,
+        apply_chunking=True,
+        input_format="markdown",
+        extra_args={
+            "temperature": 0.0,
+            "max_tokens": 2000,
+        },
+        retries=3,
+    )
+
+    crawl_cfg = CrawlerRunConfig(
+        extraction_strategy=strategy,
+        cache_mode=CacheMode.BYPASS,
+        process_iframes=False,
+        remove_overlay_elements=True,
+        exclude_external_links=True,
+        js_code=[scroll_script()],
+        wait_for="js:() => new Promise(r => setTimeout(r, 3000))" 
+    )
+
+    # Add retry logic for rate limiting
+    max_retries = 5
     retry_count = 0
+    base_delay = 5 
     
     while retry_count < max_retries:
         try:
-            async with AsyncWebCrawler(config=BrowserConfig(
-                headless=True,
-                stealth_mode=True,
-                javascript_enabled=True,
-                block_resources=["image", "stylesheet"],
-                viewport_width=1280,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                extra_args={
-                    "--disable-blink-features": "AutomationControlled"
-                }
-            )) as crawler:
-                run_cfg = CrawlerRunConfig(
-                    cache_mode=CacheMode.SMART,
-                    cache_expiry=3600,  # 1 hour
-                    cache_key=hashlib.md5(URL.encode()).hexdigest()
-                )
-                res = await crawler.arun(url=URL, config=run_cfg)
+            async with AsyncWebCrawler(config=BrowserConfig(headless=True, verbose=True)) as crawler:
+                res = await crawler.arun(url=URL, config=crawl_cfg)
                 
-                # Response validation
-                if getattr(res, "status_code", None) == 429:
-                    raise Exception("Rate limit exceeded")
+                # Print the full response for debugging
+                print("\n[RAW RESPONSE]")
+                print(res.extracted_content)
                 
-                # Process response
+                if not res.success:
+                    print("Error:", res.error_message)
+                    raise Exception(res.error_message)
+
+                # Save raw response for debugging
+                with open("debug_output.json", "w") as f:
+                    f.write(res.extracted_content)
+
+                # Process the extraction results
                 process_extraction_results(res.extracted_content)
-                break
+                break  # Success, exit the retry loop
                 
         except Exception as e:
             retry_count += 1
-            delay = min(120, base_delay * (2 ** retry_count))
-            
-            if "rate limit" in str(e).lower():
-                print(f"Rate limited. Retrying in {delay}s (Attempt {retry_count})")
-                await asyncio.sleep(delay)
+            if "rate limit" in str(e).lower() and retry_count < max_retries:
+                wait_time = min(60, base_delay * (2 ** retry_count))  # Exponential backoff
+                print(f"Rate limit error. Waiting {wait_time} seconds before retrying...")
+                await asyncio.sleep(wait_time)
+            elif retry_count < max_retries:
+                print(f"Error: {e}. Retrying... (Attempt {retry_count}/{max_retries})")
+                await asyncio.sleep(base_delay)
             else:
-                print(f"Error: {e}")
-                if retry_count < max_retries:
-                    print(f"Retrying in {delay}s")
-                    await asyncio.sleep(delay)
-                else:
-                    print("Max retries exceeded")
-                    raise
+                print(f"Failed after {max_retries} attempts: {e}")
+                break
 
 def scroll_script():
     """Return JavaScript to scroll the page and load all products"""
@@ -149,27 +173,11 @@ def scroll_script():
     """
 
 def process_extraction_results(content: str):
-    """Process the extraction results with enhanced error handling"""
+    """Process the extraction results and save to CSV"""
     try:
-        # Enhanced JSON extraction
-        if isinstance(content, str):
-            # Handle string-wrapped JSON responses
-            if content.startswith('"') and content.endswith('"'):
-                content = content[1:-1].replace('\\"', '"')
-            # Attempt JSON parsing
-            try:
-                data = json.loads(content)
-            except json.JSONDecodeError:
-                # Handle LLM's markdown-style JSON responses
-                md_match = re.search(r'```json\s*(\{.*?\})\s*```', content, re.DOTALL)
-                if md_match:
-                    data = json.loads(md_match.group(1))
-                else:
-                    raise ValueError("No valid JSON found in response")
-        else:
-            # If content is already a dict/list
-            data = content
-
+        # Try to parse JSON
+        data = json.loads(content)
+        
         # Handle different possible response structures
         if isinstance(data, dict):
             if "products" in data:
@@ -195,12 +203,12 @@ def process_extraction_results(content: str):
                     
                 # Handle price field which might be missing or malformed
                 if "price" not in item:
-                    # Look for price in keys or values that contain ₹ symbol
+                    # Look for price in keys or values that contain â‚¹ symbol
                     for k, v in item.items():
-                        if isinstance(k, str) and "₹" in k:
+                        if isinstance(k, str) and "â‚¹" in k:
                             item["price"] = k
                             break
-                        elif isinstance(v, str) and "₹" in v:
+                        elif isinstance(v, str) and "â‚¹" in v:
                             item["price"] = v
                             break
                 
@@ -250,6 +258,9 @@ def process_extraction_results(content: str):
 
         print(f"\nSaved {len(products)} products to products.csv")
         
-    except Exception as e:
-        print("Error processing extraction results:", e)
-        raise
+    except json.JSONDecodeError as e:
+        print("JSON Error:", e)
+        print("Raw content:", content)
+
+if __name__ == "__main__":
+    asyncio.run(main())
